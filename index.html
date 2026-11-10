@@ -13,14 +13,18 @@
 <style>
 *,*::before,*::after{box-sizing:border-box}
 html,body{margin:0;padding:0;height:100%;background:#000}
-body{color:#fff;-webkit-font-smoothing:antialiased;overflow:hidden}
+body{color:#fff;-webkit-font-smoothing:antialiased;overflow:hidden;
+  font-family:"Manrope",system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif}
 #sky{position:fixed;inset:0;width:100%;height:100%;display:block}
 .stage{position:relative;z-index:1;display:grid;place-items:center;min-height:100svh}
 .brand{padding:28px}
-h1{margin:0;color:#fff;font-family:"Manrope",system-ui,-apple-system,"Segoe UI",Helvetica,Arial,sans-serif;
-  font-size:clamp(2.6rem,7.5vw,7.5rem);font-weight:500;line-height:1;letter-spacing:-.065em;text-align:center}
+h1{margin:0;color:#fff;font-size:clamp(2.6rem,7.5vw,7.5rem);font-weight:500;line-height:1;letter-spacing:-.065em;text-align:center;
+  animation:rise 1.6s cubic-bezier(.2,.7,.2,1) both}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @media (max-width:600px){h1{font-size:clamp(2.2rem,10vw,4rem)}}
-@media (prefers-reduced-motion:reduce){</style>
+
+@media (prefers-reduced-motion:reduce){h1{animation:none}}
+</style>
 </head>
 <body>
 <canvas id="sky" aria-hidden="true"></canvas>
@@ -32,110 +36,261 @@ h1{margin:0;color:#fff;font-family:"Manrope",system-ui,-apple-system,"Segoe UI",
 <script>
 (() => {
   const canvas = document.getElementById('sky');
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false });
   const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
-  let W = 0, H = 0, dpr = 1, stars = [], meteor = null, nextMeteor = 0;
 
-  // Shooting-star direction: top-left to bottom-right, same angle for all
+  // ---------- Milky Way variants ----------
+  // glow: peak brightness of the haze (0..1)   dens: faint band-star density
+  // width: band half-width (fraction of the short screen side)   rift: dust-lane strength
+  // core: galactic-centre bulge strength, coreAt: its position along the band
+  // off: band centre offset from screen centre   tilt: fixed band angle in degrees (default follows the screen diagonal)
+  const VARIANTS = [
+    { name: 'Whisper', glow: 0.07, dens: 1.0, width: 0.13, rift: 0.55, core: 0, coreAt: 0, off: [0, 0] }
+  ];
+  let vi = 0, prevVi = 0, fadeAt = -1e9;
+  const FADE = 700;
+
+  // One shared direction for every shooting star: top-left to bottom-right
   const ANGLE = 35 * Math.PI / 180;
   const DX = Math.cos(ANGLE), DY = Math.sin(ANGLE);
 
+  let W = 0, H = 0, dpr = 1;
+  let FW = 0, FH = 0;
+  let stars = [];
+  let meteor = null, nextAt = 0, zones = [];
+  let bg = null, bgPrev = null, dune = null, buildTimer = 0;
+
+  // ---------- noise ----------
+  function hash(i, j) { const n = Math.sin(i * 127.1 + j * 311.7) * 43758.5453; return n - Math.floor(n); }
+  function vnoise(x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    let fx = x - xi, fy = y - yi;
+    fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy);
+    const a = hash(xi, yi), b = hash(xi + 1, yi), c = hash(xi, yi + 1), d = hash(xi + 1, yi + 1);
+    return a + (b - a) * fx + (c - a) * fy + (a - b - c + d) * fx * fy;
+  }
+  function fbm(x, y) {
+    let s = 0, amp = 0.5;
+    for (let o = 0; o < 4; o++) { s += amp * vnoise(x, y); x *= 2.03; y *= 2.03; amp *= 0.5; }
+    return s / 0.9375;
+  }
+
+  // ---------- band shape: 0..~1 intensity at a screen point ----------
+  function bandFn(v) {
+    const S = Math.min(W, H);
+    const th = v.tilt !== undefined ? v.tilt * Math.PI / 180 : -Math.atan2(H, W) * 0.92;
+    const ax = Math.cos(th), ay = Math.sin(th);
+    const cx = W * (0.5 + v.off[0]), cy = H * (0.5 + v.off[1]);
+    const norm = 1 / (0.7 + 0.45 * v.core);
+    return (x, y) => {
+      const px = x - cx, py = y - cy;
+      const al = (px * ax + py * ay) / S, d = (-px * ay + py * ax) / S;
+      const cb = v.core * Math.exp(-Math.pow((al - v.coreAt) / 0.38, 2));
+      const w = v.width * (1 + 0.55 * cb);
+      let I = Math.exp(-(d * d) / (w * w));
+      if (I < 0.004) return 0;
+      I *= (0.7 + 0.45 * cb) * norm;
+      I *= 0.3 + 1.3 * fbm(al * 3.1 + 3, d * 7 + 11);                       // cloudy structure
+      // dust rift: a wandering dark lane of varying width and strength
+      const rc = v.width * (0.12 + 0.9 * (fbm(al * 1.6 + 20, 5.5) - 0.5));
+      const rw = v.width * (0.16 + 0.35 * fbm(al * 3.7 + 40, 9.1));
+      const rs = v.rift * Math.min(1, 0.35 + 1.3 * fbm(al * 2.3 + 60, 2.2));
+      I *= 1 - rs * Math.exp(-Math.pow((d - rc) / rw, 2));
+      // keep the sky a little quieter right behind the name
+      const lx = (x - W / 2) / (0.34 * W), ly = (y - H / 2) / (0.11 * H);
+      I *= 1 - 0.45 * Math.exp(-lx * lx - ly * ly);
+      return I;
+    };
+  }
+
+  function duneY(x) {
+    const u = x / W;
+    return H * (0.9 + 0.035 * Math.sin(u * 2.4 + 0.9) - 0.012 * Math.sin(u * 6.3 + 2.1));
+  }
+
+  // Pre-render the static part of the sky (haze + thousands of faint band stars) once per variant/size
+  function buildBg(v) {
+    const c = document.createElement('canvas');
+    c.width = Math.round(W * dpr); c.height = Math.round(H * dpr);
+    const b = c.getContext('2d');
+    b.fillStyle = '#000'; b.fillRect(0, 0, c.width, c.height);
+    if (!v.glow) return c;
+    const f = bandFn(v);
+
+    // haze, computed small and scaled up smoothly
+    const gw = Math.max(160, Math.min(480, Math.round(W / 2)));
+    const gh = Math.max(90, Math.round(gw * H / W));
+    const g = document.createElement('canvas'); g.width = gw; g.height = gh;
+    const gc = g.getContext('2d');
+    const img = gc.createImageData(gw, gh), px = img.data;
+    const horizon = H * 0.9;
+    for (let j = 0; j < gh; j++) {
+      const y = (j + 0.5) * H / gh;
+      const air = v.air && y < horizon + H * 0.06 ? v.air * Math.exp(-Math.max(0, horizon - y) / (0.2 * H)) : 0;
+      for (let i = 0; i < gw; i++) {
+        const x = (i + 0.5) * W / gw;
+        let val = (f(x, y) * v.glow + air) * 255 + (Math.random() - 0.5);
+        val = val < 0 ? 0 : val > 255 ? 255 : val;
+        const k = (j * gw + i) * 4;
+        px[k] = px[k + 1] = px[k + 2] = val; px[k + 3] = 255;
+      }
+    }
+    gc.putImageData(img, 0, 0);
+    b.imageSmoothingEnabled = true; b.imageSmoothingQuality = 'high';
+    b.drawImage(g, 0, 0, c.width, c.height);
+
+    // unresolved starlight: a dense dusting of very faint points that follows the band
+    b.setTransform(dpr, 0, 0, dpr, 0, 0);
+    b.fillStyle = '#fff';
+    const tries = Math.min(110000, Math.round(W * H / 38 * v.dens));
+    for (let n = 0; n < tries; n++) {
+      const x = Math.random() * W, y = Math.random() * H;
+      const I = f(x, y);
+      if (Math.random() > I * 0.8) continue;
+      const r = 0.22 + Math.random() * Math.random() * 0.4;
+      b.globalAlpha = 0.18 + Math.random() * 0.6;
+      b.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    b.globalAlpha = 1;
+    return c;
+  }
+
+  function buildDune() {
+    const p = new Path2D();
+    p.moveTo(0, H + 2);
+    for (let x = 0; x <= W + 6; x += 6) p.lineTo(x, duneY(x));
+    p.lineTo(W + 6, H + 2); p.closePath();
+    dune = p;
+  }
+
+  function rebuild() {
+    bg = buildBg(VARIANTS[vi]);
+    bgPrev = null;
+    buildDune();
+    if (reduce) render(performance.now());
+  }
+
+  // ---------- foreground stars ----------
   function makeStars() {
-    const count = Math.round((W * H) / 2600);
-    stars = [];
-    for (let i = 0; i < count; i++) {
-      const r = Math.random();
-      // mostly tiny, a few slightly larger
-      const size = r < 0.75 ? 0.35 + Math.random() * 0.45
-                 : r < 0.95 ? 0.8 + Math.random() * 0.5
-                 : 1.3 + Math.random() * 0.6;
-      stars.push({
-        x: Math.random() * W,
-        y: Math.random() * H,
-        s: size,
-        base: 0.35 + Math.random() * 0.55,
-        amp: 0.2 + Math.random() * 0.45,
-        speed: 0.6 + Math.random() * 2.2,
-        phase: Math.random() * Math.PI * 2
-      });
+    const n = Math.min(2400, Math.round(FW * FH / 1700));
+    stars = new Array(n);
+    for (let i = 0; i < n; i++) {
+      const m = Math.pow(Math.random(), 3.2);       // many faint stars, very few bright ones
+      const f1 = 0.7 + Math.random() * 2.6;
+      stars[i] = {
+        x: Math.random() * FW, y: Math.random() * FH,
+        r: 0.35 + m * 0.95,
+        base: 0.32 + 0.68 * Math.sqrt(m),
+        depth: 0.25 + Math.random() * 0.65,
+        f1, f2: f1 * (1.7 + Math.random() * 1.3),
+        p1: Math.random() * 6.283, p2: Math.random() * 6.283
+      };
     }
   }
 
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);
     W = window.innerWidth; H = window.innerHeight;
-    canvas.width = W * dpr; canvas.height = H * dpr;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    makeStars();
-    if (reduce) drawStars(0);
+    if (W > FW || H > FH) {
+      FW = Math.max(FW, W);
+      FH = Math.max(FH, H, (window.screen && screen.height) || 0);
+      makeStars();
+    }
+    if (!bg) rebuild();
+    else { clearTimeout(buildTimer); buildTimer = setTimeout(rebuild, 160); if (reduce) render(performance.now()); }
   }
 
   function drawStars(t) {
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, W, H);
-    for (const s of stars) {
-      const a = reduce ? s.base
-        : Math.max(0.05, Math.min(1, s.base + Math.sin(t * s.speed + s.phase) * s.amp));
-      ctx.globalAlpha = a;
-      ctx.fillStyle = '#fff';
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.s, 0, Math.PI * 2);
-      ctx.fill();
-      if (s.s > 1.2) { // soft glow on the larger ones
-        ctx.globalAlpha = a * 0.15;
-        ctx.beginPath();
-        ctx.arc(s.x, s.y, s.s * 3, 0, Math.PI * 2);
-        ctx.fill();
+    ctx.fillStyle = '#fff';
+    for (let i = 0; i < stars.length; i++) {
+      const s = stars[i];
+      if (s.x > W || s.y > H) continue;
+      let a = s.base;
+      if (!reduce) {
+        const v = Math.sin(t * s.f1 + s.p1) * 0.6 + Math.sin(t * s.f2 + s.p2) * 0.4;
+        a *= 1 - s.depth * (0.5 - 0.5 * v);
       }
+      ctx.globalAlpha = a;
+      if (s.r < 0.8) ctx.fillRect(s.x - s.r, s.y - s.r, s.r * 2, s.r * 2);
+      else { ctx.beginPath(); ctx.arc(s.x, s.y, s.r, 0, 6.283); ctx.fill(); }
     }
     ctx.globalAlpha = 1;
   }
 
+  // ---------- shooting stars ----------
   function spawnMeteor(now) {
-    // start anywhere in the upper/left band so paths cross different parts of the screen
-    const fromTop = Math.random() < 0.6;
-    const x = fromTop ? Math.random() * W * 0.85 : -40;
-    const y = fromTop ? -40 + Math.random() * H * 0.25 : Math.random() * H * 0.6;
+    if (!zones.length) {
+      zones = [0, 1, 2, 3, 4, 5];
+      for (let i = zones.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [zones[i], zones[j]] = [zones[j], zones[i]];
+      }
+    }
+    const z = zones.pop(), col = z % 3, row = (z / 3) | 0;
+    const dist = (0.26 + Math.random() * 0.22) * Math.hypot(W, H);
     meteor = {
-      x, y,
-      len: 90 + Math.random() * 110,
-      speed: 650 + Math.random() * 450, // px per second
-      born: now,
-      life: 0.9 + Math.random() * 0.7   // seconds
+      x: (-0.05 + (col + Math.random()) / 3 * 0.8) * W,
+      y: (-0.08 + (row + Math.random()) / 2 * 0.6) * H,
+      dist, len: dist * (0.32 + Math.random() * 0.2),
+      dur: 700 + Math.random() * 500, born: now
     };
   }
 
   function drawMeteor(now) {
     const m = meteor;
-    const age = (now - m.born) / 1000;
-    if (age > m.life) { meteor = null; nextMeteor = now + 2000 + Math.random() * 3000; return; }
-    const hx = m.x + DX * m.speed * age;
-    const hy = m.y + DY * m.speed * age;
-    const tx = hx - DX * m.len, ty = hy - DY * m.len;
-    // fade in quickly, fade out toward the end
-    const p = age / m.life;
-    const alpha = p < 0.15 ? p / 0.15 : 1 - Math.pow((p - 0.15) / 0.85, 2);
+    const p = (now - m.born) / m.dur;
+    if (p >= 1) { meteor = null; nextAt = now + 2200 + Math.random() * 3300; return; }
+    const e = p * (1.35 - 0.35 * p);
+    const d = e * m.dist;
+    const hx = m.x + DX * d, hy = m.y + DY * d;
+    const tail = Math.min(m.len, d);
+    const tx = hx - DX * tail, ty = hy - DY * tail;
+    const a = Math.min(1, p / 0.12) * (p < 0.6 ? 1 : 1 - Math.pow((p - 0.6) / 0.4, 2));
+
+    const w = 1.1, nx = -DY * w, ny = DX * w;
     const g = ctx.createLinearGradient(hx, hy, tx, ty);
-    g.addColorStop(0, `rgba(255,255,255,${0.95 * alpha})`);
+    g.addColorStop(0, `rgba(255,255,255,${0.95 * a})`);
+    g.addColorStop(0.25, `rgba(255,255,255,${0.4 * a})`);
     g.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.strokeStyle = g;
-    ctx.lineWidth = 1.4;
-    ctx.lineCap = 'round';
-    ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(tx, ty); ctx.stroke();
-    ctx.fillStyle = `rgba(255,255,255,${alpha})`;
-    ctx.beginPath(); ctx.arc(hx, hy, 1.3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.moveTo(hx + nx, hy + ny); ctx.lineTo(tx, ty); ctx.lineTo(hx - nx, hy - ny); ctx.closePath(); ctx.fill();
+
+    const glow = ctx.createRadialGradient(hx, hy, 0, hx, hy, 7);
+    glow.addColorStop(0, `rgba(255,255,255,${0.55 * a})`);
+    glow.addColorStop(1, 'rgba(255,255,255,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath(); ctx.arc(hx, hy, 7, 0, 6.283); ctx.fill();
+    ctx.fillStyle = `rgba(255,255,255,${a})`;
+    ctx.beginPath(); ctx.arc(hx, hy, 1.25, 0, 6.283); ctx.fill();
   }
 
-  function frame(now) {
+  // ---------- frame ----------
+  function render(now) {
+    const k = reduce ? 1 : Math.min(1, (now - fadeAt) / FADE);
+    const t = k * k * (3 - 2 * k);
+    ctx.globalAlpha = 1;
+    if (bgPrev && t < 1) {
+      ctx.drawImage(bgPrev, 0, 0, W, H);
+      ctx.globalAlpha = t; ctx.drawImage(bg, 0, 0, W, H); ctx.globalAlpha = 1;
+    } else {
+      bgPrev = null;
+      ctx.drawImage(bg, 0, 0, W, H);
+    }
     drawStars(now / 1000);
-    if (!meteor && now >= nextMeteor) spawnMeteor(now);
-    if (meteor) drawMeteor(now);
-    requestAnimationFrame(frame);
+    if (!reduce) {
+      if (!meteor && now >= nextAt) spawnMeteor(now);
+      if (meteor) drawMeteor(now);
+    }
+    const dn = VARIANTS[vi].dune ? t : (VARIANTS[prevVi].dune ? 1 - t : 0);
+    if (dn > 0 && dune) { ctx.globalAlpha = dn; ctx.fillStyle = '#000'; ctx.fill(dune); ctx.globalAlpha = 1; }
   }
+  function frame(now) { render(now); requestAnimationFrame(frame); }
 
   window.addEventListener('resize', resize);
   resize();
-  if (!reduce) { nextMeteor = performance.now() + 1200; requestAnimationFrame(frame); }
+  if (!reduce) { nextAt = performance.now() + 1400; requestAnimationFrame(frame); }
 })();
 </script>
 </body>
